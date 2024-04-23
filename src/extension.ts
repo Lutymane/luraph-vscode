@@ -97,7 +97,19 @@ export function activate(context: vscode.ExtensionContext) {
 
     try {
       log("> Fetching nodes...");
-      const nodes = await luraphApi.getNodes();
+
+      const nodesPromise = luraphApi.getNodes();
+
+      vscode.window.withProgress(
+        {
+          title: "Fetching Luraph Nodes...",
+          location: vscode.ProgressLocation.Notification,
+          cancellable: true,
+        },
+        progress => nodesPromise
+      );
+
+      const nodes = await nodesPromise;
 
       const recommendedId = nodes.recommendedId;
       log(`> Recommended node: ${recommendedId || "[none]"}`);
