@@ -421,6 +421,24 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
+      const confirm = await vscode.window.showInformationMessage(
+        "Confirm options",
+        {
+          modal: true,
+          detail: Object.entries(userOptionValues)
+            .map(
+              ([id, val]) =>
+                `${nodeInfo.options[id].name}: ${
+                  typeof val === "boolean" ? (val ? "✅" : "❌") : val
+                }`
+            )
+            .join("\n"),
+        },
+        "Obfuscate"
+      );
+
+      if (confirm !== "Obfuscate") return;
+
       statusBarItem.text = "$(gear~spin) Obfuscating...";
       const { jobId } = await luraphApi.createNewJob(
         nodeId,
