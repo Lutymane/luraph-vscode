@@ -28,7 +28,7 @@ export function activate(context: vscode.ExtensionContext) {
   const logOutput = vscode.window.createOutputChannel("Luraph", {
     log: true,
   });
-  const log = (msg: string) => logOutput.info(msg);
+  const log = logOutput.info;
 
   context.subscriptions.push(statusBarItem, logOutput); //auto dispose on extension deactivation
 
@@ -96,7 +96,7 @@ export function activate(context: vscode.ExtensionContext) {
     const availableNodes: vscode.QuickPickItem[] = [];
 
     try {
-      log("> Fetching nodes...");
+      // log("> Fetching nodes...");
 
       const nodesPromise = luraphApi.getNodes();
 
@@ -112,9 +112,9 @@ export function activate(context: vscode.ExtensionContext) {
       const nodes = await nodesPromise;
 
       const recommendedId = nodes.recommendedId;
-      log(`> Recommended node: ${recommendedId || "[none]"}`);
+      // log(`> Recommended node: ${recommendedId || "[none]"}`);
 
-      log("> Available nodes:");
+      // log("> Available nodes:");
       for (const [nodeId, nodeInfo] of Object.entries(nodes.nodes)) {
         const recommended = nodeId === recommendedId;
         const description = recommended ? " (recommended)" : undefined;
@@ -122,7 +122,7 @@ export function activate(context: vscode.ExtensionContext) {
           Object.keys(nodeInfo.options).length
         } options`;
 
-        log(`> - ${nodeId}: [${details}]${description ?? ""}`);
+        // log(`> - ${nodeId}: [${details}]${description ?? ""}`);
 
         const quickPickItem = {
           iconPath: recommended ? new vscode.ThemeIcon("heart") : undefined,
@@ -156,60 +156,264 @@ export function activate(context: vscode.ExtensionContext) {
       // log(`> Selected node: ${nodeId}`);
       // log("> Available options:");
 
-      const optionValues: LuraphOptionList = {};
-      const checkboxes: (vscode.QuickPickItem & { id: string })[] = [];
-      const dropdowns = [];
-      const textFields = [];
+      const userOptionValues: LuraphOptionList = {};
 
-      for (const [optionId, { name, description, tier, type, choices }] of Object.entries(
-        nodeInfo.options
-      )) {
-        const tierIcon = TIER_ICONS[tier];
-        const tierText = TIER_TEXT[tier];
-        const tierTextParen = tierText ? ` (${tierText})` : "";
+      // @note topologically sort options
+      let idOrder: string[];
+      {
+        /**
+         * @note options that depend on each other
+         */
+        let linkedOptions: string[] = [];
+        Object.entries(nodeInfo.options).forEach(([id, option]) => {
+          if (option.dependencies) {
+            linkedOptions.push(id);
+            Object.keys(option.dependencies).forEach(id => linkedOptions.push(id));
+          }
+        });
+
+        linkedOptions = linkedOptions
+          // @note group dropdowns
+          .sort((a, b) => (nodeInfo.options[a].type === "DROPDOWN" ? -1 : 0));
+
+        const topologicalSort = (arr: string[]) => {
+          const visited = new Map<string, boolean>();
+          const result: string[] = [];
+
+          const visit = (id: string) => {
+            if (visited.get(id)) return;
+            visited.set(id, true);
+
+            const { dependencies } = nodeInfo.options[id];
+            // @note put dependencies before dependent options
+            if (dependencies) {
+              Object.keys(dependencies).forEach(visit);
+            }
+
+            result.push(id);
+          };
+
+          arr.forEach(visit);
+
+          return result;
+        };
+
+        linkedOptions = topologicalSort(linkedOptions);
+
+        // @note put linked before
+        idOrder = [
+          ...linkedOptions,
+          ...Object.keys(nodeInfo.options).sort(a =>
+            nodeInfo.options[a].type === "CHECKBOX" ? -1 : 0
+          ),
+        ]
+          // @note remove dupes
+          .filter((v, i, arr) => arr.indexOf(v) === i);
+
+        log(
+          JSON.stringify(
+            idOrder.map(id => `${id} : ${nodeInfo.options[id].type}`),
+            null,
+            4
+          )
+        );
+      }
+
+      for (let i = 0; i < idOrder.length; ) {
+        let optionId = idOrder[i];
+        let { name, description, tier, type, choices, dependencies } = nodeInfo.options[optionId];
+
+        let tierIcon = TIER_ICONS[tier];
+        let tierText = TIER_TEXT[tier];
+        let tierTextParen = tierText ? ` (${tierText})` : "";
 
         // log(`> - [${optionId}] ${name}${tierTextParen} - ${description} (${type})`);
 
         switch (type) {
           case "CHECKBOX": {
-            optionValues[optionId] = false;
+            type TCheckbox = vscode.QuickPickItem & { id: string };
+            let checkboxCluster: TCheckbox[] = [];
 
-            checkboxes.push({
-              id: optionId,
-              label: name,
-              description: optionId + tierTextParen,
-              detail: description,
-              iconPath: tierIcon,
+            while (true) {
+              userOptionValues[optionId] = false;
+
+              // @note put options with dependencies at the end
+              checkboxCluster.push({
+                id: optionId,
+                label: name,
+                description: optionId + tierTextParen,
+                detail: description,
+                iconPath: tierIcon,
+              });
+
+              i += 1;
+
+              optionId = idOrder[i];
+
+              if (nodeInfo.options[optionId]?.type !== "CHECKBOX") break;
+
+              ({ name, description, tier, type, choices, dependencies } =
+                nodeInfo.options[optionId]);
+
+              tierIcon = TIER_ICONS[tier];
+              tierText = TIER_TEXT[tier];
+              tierTextParen = tierText ? ` (${tierText})` : "";
+            }
+
+            const selectedValues = await new Promise<readonly TCheckbox[] | undefined>(resolve => {
+              const disposables: vscode.Disposable[] = [];
+
+              const dispose = () => {
+                disposables.forEach(d => d.dispose());
+              };
+
+              const optionsPick = vscode.window.createQuickPick<(typeof checkboxCluster)[number]>();
+              disposables.push(optionsPick);
+
+              // @note initial visible items
+              const getVisibleOptions = () =>
+                checkboxCluster.filter(({ id }) => {
+                  let option = nodeInfo.options[id];
+
+                  if (!option.dependencies) return true;
+
+                  for (let [depId, depVals] of Object.entries(option.dependencies)) {
+                    if (
+                      // @note check previously selected options
+                      !depVals.includes(userOptionValues[depId]) &&
+                      // @note check current selected cluster dependencies
+                      !depVals.includes(!!optionsPick.selectedItems.find(i => i.id === depId))
+                    ) {
+                      return false;
+                    }
+                  }
+
+                  return true;
+                });
+
+              optionsPick.title = "Luraph - Select Options (checkbox)";
+              optionsPick.placeholder = "Option name/ID";
+
+              optionsPick.items = getVisibleOptions();
+
+              optionsPick.ignoreFocusOut = true;
+              optionsPick.canSelectMany = true;
+              optionsPick.matchOnDescription = true;
+
+              /**
+               * @note onDidChangeSelection is also triggered when you edit `.selectedItems` property, which gets reset when changing `.items` for some reason, so we need to reapply selected items without creating infinite loop, where event is triggered inside its handler
+               */
+              let ignoreSelectionUpdate = false;
+
+              disposables.push(
+                optionsPick.onDidAccept(() => {
+                  // @note call resolve first so items are not empty
+                  resolve(optionsPick.selectedItems);
+                  dispose();
+                }),
+
+                optionsPick.onDidChangeSelection(items => {
+                  // log(
+                  //   `onDidChangeSelection ${JSON.stringify(items.map(i => i.id))} / ${JSON.stringify(
+                  //     optionsPick.selectedItems.map(i => i.id)
+                  //   )} :: ignored: ${ignoreSelectionUpdate}`
+                  // );
+
+                  if (ignoreSelectionUpdate) {
+                    ignoreSelectionUpdate = false;
+                    return;
+                  }
+
+                  const visibleOptions = getVisibleOptions();
+                  // @note if different set of options, then update, tbh we could remove this check and update every time
+                  if (!visibleOptions.every((o, i) => o.id === optionsPick.items[i].id)) {
+                    optionsPick.items = visibleOptions;
+                    optionsPick.selectedItems = items;
+                    ignoreSelectionUpdate = true;
+                  }
+                }),
+
+                optionsPick.onDidHide(() => {
+                  resolve(undefined);
+                  dispose();
+                })
+              );
+
+              optionsPick.show();
             });
+
+            // log(
+            //   `selectedValues: ${
+            //     selectedValues &&
+            //     JSON.stringify(
+            //       selectedValues.map(i => i.id),
+            //       null,
+            //       4
+            //     )
+            //   }`
+            // );
+
+            if (!selectedValues) {
+              return;
+            }
+
+            for (const checkboxInfo of selectedValues) {
+              userOptionValues[checkboxInfo.id] = true;
+            }
+
             break;
           }
           case "DROPDOWN": {
-            optionValues[optionId] = choices[0];
+            userOptionValues[optionId] = choices[0];
 
             // log(`    Choices: [${choices.join(", ")}]`);
 
-            dropdowns.push({
-              id: optionId,
-              title: `${name}${tierTextParen} - ${description} [${optionId}]`,
-              placeHolder: `Value for ${name}`,
-              items: choices.map((choice, index) => ({
+            const selectedValue = await vscode.window.showQuickPick(
+              choices.map((choice, index) => ({
                 label: choice,
                 description: tierText,
                 iconPath: index !== 0 ? tierIcon : undefined,
                 picked: index === 0,
               })) as vscode.QuickPickItem[],
-            });
+              {
+                title: `Luraph - Select Option: ${name}${tierTextParen} - ${description} [${optionId}]`,
+                placeHolder: `Value for ${name}`,
+
+                ignoreFocusOut: true,
+                canPickMany: false,
+                matchOnDetail: true,
+              }
+            );
+
+            if (!selectedValue) {
+              return;
+            }
+
+            userOptionValues[optionId] = selectedValue.label;
+
+            i += 1;
+
             break;
           }
           case "TEXT": {
-            optionValues[optionId] = "";
+            userOptionValues[optionId] = "";
 
-            textFields.push({
-              id: optionId,
-              title: `${name}${tierTextParen} [${optionId}]`,
+            const selectedValue = await vscode.window.showInputBox({
+              title: `Luraph - Select Option: ${name}${tierTextParen} [${optionId}]`,
               prompt: description,
               placeHolder: `Value for ${name} (leave empty to use default value)`,
+
+              ignoreFocusOut: true,
             });
+
+            if (!selectedValue) {
+              return;
+            }
+
+            userOptionValues[optionId] = selectedValue;
+
+            i += 1;
+
             break;
           }
           default:
@@ -217,169 +421,12 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
-      // @note show target before options, because options can depend on selected target
-      {
-        const [targetVersionDropdown] = dropdowns.splice(
-          dropdowns.findIndex(d => d.id === "TARGET_VERSION"),
-          1
-        );
-
-        const { id, title, placeHolder, items } = targetVersionDropdown;
-
-        const selectedTarget = await vscode.window.showQuickPick(items, {
-          title: `Luraph - Select Option: ${title}`,
-          placeHolder,
-
-          ignoreFocusOut: true,
-          canPickMany: false,
-          matchOnDetail: true,
-        });
-
-        if (!selectedTarget) {
-          return;
-        }
-
-        optionValues[id] = selectedTarget.label;
-      }
-
-      const selectedValues = await new Promise<any[] | undefined>(resolve => {
-        const disposables: vscode.Disposable[] = [];
-
-        const dispose = () => {
-          disposables.forEach(d => d.dispose());
-        };
-
-        const optionsPick = vscode.window.createQuickPick<(typeof checkboxes)[number]>();
-        disposables.push(optionsPick);
-
-        // @note initial visible items
-        const getVisibleOptions = () =>
-          checkboxes.filter(({ id }) => {
-            let option = nodeInfo.options[id];
-
-            if (!option.dependencies) return true;
-
-            for (let [depId, depVals] of Object.entries(option.dependencies)) {
-              if (
-                !depVals.includes(optionValues[depId]) &&
-                !depVals.includes(!!optionsPick.selectedItems.find(i => i.id === depId))
-              ) {
-                return false;
-              }
-            }
-
-            return true;
-          });
-
-        optionsPick.title = "Luraph - Select Options (checkbox)";
-        optionsPick.placeholder = "Option name/ID";
-
-        optionsPick.items = getVisibleOptions();
-
-        optionsPick.ignoreFocusOut = true;
-        optionsPick.canSelectMany = true;
-        optionsPick.matchOnDescription = true;
-
-        /**
-         * @note onDidChangeSelection is also triggered when you edit `.selectedItems` property, which gets reset when changing `.items` for some reason, so we need to reapply selected items without creating infinite loop, where event is triggered inside its handler
-         */
-        let ignoreSelectionUpdate = false;
-
-        disposables.push(
-          optionsPick.onDidAccept(() => {
-            // @note call resolve first so items are not empty
-            resolve(optionsPick.selectedItems);
-            dispose();
-          }),
-
-          optionsPick.onDidChangeSelection(items => {
-            // log(
-            //   `onDidChangeSelection ${JSON.stringify(items.map(i => i.id))} / ${JSON.stringify(
-            //     optionsPick.selectedItems.map(i => i.id)
-            //   )} :: ignored: ${ignoreSelectionUpdate}`
-            // );
-
-            if (ignoreSelectionUpdate) {
-              ignoreSelectionUpdate = false;
-              return;
-            }
-
-            const visibleOptions = getVisibleOptions();
-            // @note if different set of options, then update, tbh we could remove this check and update every time
-            if (!visibleOptions.every((o, i) => o.id === optionsPick.items[i].id)) {
-              optionsPick.items = visibleOptions;
-              optionsPick.selectedItems = items;
-              ignoreSelectionUpdate = true;
-            }
-          }),
-
-          optionsPick.onDidHide(() => {
-            resolve(undefined);
-            dispose();
-          })
-        );
-
-        optionsPick.show();
-      });
-
-      // log(
-      //   `selectedValues: ${
-      //     selectedValues &&
-      //     JSON.stringify(
-      //       selectedValues.map(i => i.id),
-      //       null,
-      //       4
-      //     )
-      //   }`
-      // );
-
-      if (!selectedValues) {
-        return;
-      }
-
-      for (const checkboxInfo of selectedValues) {
-        optionValues[checkboxInfo.id] = true;
-      }
-
-      for (const { id, title, placeHolder, items } of dropdowns) {
-        const selectedValue = await vscode.window.showQuickPick(items, {
-          title: `Luraph - Select Option: ${title}`,
-          placeHolder,
-
-          ignoreFocusOut: true,
-          canPickMany: false,
-          matchOnDetail: true,
-        });
-
-        if (!selectedValue) {
-          return;
-        }
-
-        optionValues[id] = selectedValue.label;
-      }
-
-      for (const { id, title, prompt, placeHolder } of textFields) {
-        const selectedValue = await vscode.window.showInputBox({
-          title: `Luraph - Select Option: ${title}`,
-          prompt,
-          placeHolder,
-
-          ignoreFocusOut: true,
-        });
-
-        if (!selectedValue) {
-          return;
-        }
-
-        optionValues[id] = selectedValue;
-      }
-
       statusBarItem.text = "$(gear~spin) Obfuscating...";
       const { jobId } = await luraphApi.createNewJob(
         nodeId,
         contents,
         `[luraph-vscode] ${fileName}`,
-        optionValues
+        userOptionValues
       );
 
       log(`> Job ID: ${jobId}`);
